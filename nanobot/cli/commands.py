@@ -1129,5 +1129,218 @@ def _login_github_copilot() -> None:
         raise typer.Exit(1)
 
 
+# ============================================================================
+# Task Management Commands  (tasks / workers / ipc)
+# ============================================================================
+
+tasks_app = typer.Typer(help="Manage async tasks")
+app.add_typer(tasks_app, name="tasks")
+
+workers_app = typer.Typer(help="Manage worker pool")
+app.add_typer(workers_app, name="workers")
+
+ipc_app = typer.Typer(help="File IPC utilities")
+app.add_typer(ipc_app, name="ipc")
+
+
+def _get_runtime_dir() -> Path:
+    """Return the runtime directory (workspace/runtime)."""
+    from nanobot.config.paths import get_workspace_path
+
+    return get_workspace_path() / "runtime"
+
+
+_TASK_STATUS_COLORS = {
+    "done": "green",
+    "failed": "red",
+    "running": "yellow",
+    "pending": "blue",
+    "queued": "blue",
+}
+
+
+@tasks_app.command("submit")
+def tasks_submit(
+    task: str = typer.Argument(..., help="Task instruction or JSON payload"),
+    label: str = typer.Option(None, "--label", "-l", help="Human-readable label"),
+    via_ipc: bool = typer.Option(False, "--ipc", help="Submit via file IPC instead of direct DB write"),
+):
+    """Submit a new task to the async task queue."""
+    import asyncio
+    import json as _json
+
+    runtime_dir = _get_runtime_dir()
+
+    # Parse task as JSON payload if it looks like JSON, otherwise wrap it.
+    try:
+        payload = _json.loads(task)
+        if not isinstance(payload, dict):
+            payload = {"task": task}
+    except _json.JSONDecodeError:
+        payload = {"task": task}
+
+    if via_ipc:
+        from nanobot.tasks.ipc_writer import write_task
+
+        task_id = write_task(runtime_dir, payload, label=label)
+        console.print(f"[green]Task queued via IPC:[/green] {task_id}")
+        return
+
+    async def _submit():
+        from nanobot.tasks.db import create_task, init_db
+
+        conn = await init_db(runtime_dir)
+        try:
+            task_id = await create_task(conn, payload=payload, label=label)
+            console.print(f"[green]Task created:[/green] {task_id}")
+        finally:
+            await conn.close()
+
+    asyncio.run(_submit())
+
+
+@tasks_app.command("poll")
+def tasks_poll(
+    task_id: str = typer.Argument(..., help="Task ID to poll"),
+    timeout: float = typer.Option(60.0, "--timeout", "-t", help="Polling timeout in seconds"),
+):
+    """Wait for a task to complete and print its result."""
+    import asyncio
+
+    runtime_dir = _get_runtime_dir()
+
+    async def _poll():
+        from nanobot.tasks.db import init_db, poll_task
+
+        conn = await init_db(runtime_dir)
+        try:
+            console.print(f"Polling task [cyan]{task_id}[/cyan] (timeout={timeout}s)…")
+            row = await poll_task(conn, task_id, timeout=timeout)
+            if row is None:
+                console.print("[yellow]Timed out — task not yet complete.[/yellow]")
+                raise typer.Exit(1)
+            status = row["status"]
+            color = "green" if status == "done" else "red"
+            console.print(f"[{color}]Status:[/{color}] {status}")
+            if row.get("result"):
+                console.print(f"Result: {row['result']}")
+            if row.get("error"):
+                console.print(f"Error: {row['error']}")
+        finally:
+            await conn.close()
+
+    asyncio.run(_poll())
+
+
+@tasks_app.command("list")
+def tasks_list(
+    status: str = typer.Option(None, "--status", "-s", help="Filter by status"),
+    limit: int = typer.Option(20, "--limit", "-n", help="Maximum rows to show"),
+):
+    """List tasks in the database."""
+    import asyncio
+
+    from rich.table import Table as RichTable
+
+    runtime_dir = _get_runtime_dir()
+
+    async def _list():
+        from nanobot.tasks.db import init_db, list_tasks
+
+        conn = await init_db(runtime_dir)
+        try:
+            rows = await list_tasks(conn, status=status, limit=limit)
+        finally:
+            await conn.close()
+
+        if not rows:
+            console.print("[dim]No tasks found.[/dim]")
+            return
+
+        table = RichTable(title=f"Tasks (n={len(rows)})")
+        table.add_column("ID", style="cyan", no_wrap=True)
+        table.add_column("Label")
+        table.add_column("Status")
+        table.add_column("Created", style="dim")
+        table.add_column("Attempts")
+
+        status_colors = _TASK_STATUS_COLORS
+        for r in rows:
+            st = r["status"]
+            color = status_colors.get(st, "white")
+            table.add_row(
+                r["id"],
+                r.get("label") or "",
+                f"[{color}]{st}[/{color}]",
+                (r.get("created_at") or "")[:19],
+                str(r.get("attempts", 0)),
+            )
+        console.print(table)
+
+    asyncio.run(_list())
+
+
+@workers_app.command("status")
+def workers_status():
+    """Show worker pool status (active / waiting / max)."""
+    console.print("[dim]Worker pool status is only available when the gateway is running.[/dim]")
+    console.print("Run [cyan]nanobot gateway[/cyan] to start the worker pool.")
+
+
+@ipc_app.command("watch")
+def ipc_watch(
+    interval: float = typer.Option(1.0, "--interval", "-i", help="Poll interval in seconds"),
+):
+    """Start the IPC directory watcher (for development/testing)."""
+    import asyncio
+
+    runtime_dir = _get_runtime_dir()
+
+    async def _watch():
+        from nanobot.tasks.db import init_db
+        from nanobot.tasks.ipc_watcher import IPCWatcher
+        from nanobot.tasks.worker_pool import WorkerPool
+
+        conn = await init_db(runtime_dir)
+        pool = WorkerPool(conn, runtime_dir)
+        watcher = IPCWatcher(conn, pool, runtime_dir, poll_interval=interval)
+
+        console.print(f"[cyan]IPC watcher started[/cyan]  runtime={runtime_dir}  interval={interval}s")
+        console.print("Press Ctrl-C to stop.\n")
+
+        try:
+            await watcher.run()
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            watcher.stop()
+            await pool.shutdown()
+            await conn.close()
+            console.print("\n[dim]IPC watcher stopped.[/dim]")
+
+    asyncio.run(_watch())
+
+
+@ipc_app.command("submit")
+def ipc_submit(
+    task: str = typer.Argument(..., help="Task instruction or JSON payload"),
+    label: str = typer.Option(None, "--label", "-l", help="Human-readable label"),
+    namespace: str = typer.Option("main", "--namespace", "-n", help="IPC namespace"),
+):
+    """Drop a task JSON file into the IPC directory."""
+    import json as _json
+
+    from nanobot.tasks.ipc_writer import write_task
+
+    runtime_dir = _get_runtime_dir()
+    try:
+        payload = _json.loads(task)
+        if not isinstance(payload, dict):
+            payload = {"task": task}
+    except _json.JSONDecodeError:
+        payload = {"task": task}
+
+    task_id = write_task(runtime_dir, payload, namespace=namespace, label=label)
+    console.print(f"[green]IPC task file written:[/green] {task_id}  (namespace={namespace})")
+
+
 if __name__ == "__main__":
     app()
